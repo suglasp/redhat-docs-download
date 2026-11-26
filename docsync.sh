@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# docsync-improved.sh - mirror Red Hat product documentation (PDF) from
+# docsync.sh - mirror Red Hat product documentation (PDF) from
 #                       https://docs.redhat.com/
 #
 # Examples:
@@ -125,7 +125,11 @@ download_product_version() {
             | sort -u
     )
     if [ -z "$paths" ]; then
-        echo "  ! [$ver] no document links found"; return 0
+        # Newer topic-based portals (e.g. RHEL 10) have no per-guide html/pdf
+        # pages; instead a ".../download_pdf-<name>" reference page links to a
+        # handful of consolidated PDFs (relative hrefs like "pdfs/x.pdf").
+        download_pdf_reference "$product" "$ver" "$index_html" "$out"
+        return
     fi
 
     mkdir -p "$out" || { echo "  ! cannot create $out"; return 1; }
@@ -161,6 +165,71 @@ download_product_version() {
         if [ "$SLEEP" -gt 0 ] 2>/dev/null; then sleep "$SLEEP"; fi
     done <<EOF
 $paths
+EOF
+}
+
+# fallback for topic-based portals: fetch the download_pdf-* reference page(s)
+# and download every PDF they link to
+download_pdf_reference() {
+    local product=$1 ver=$2 index_html=$3 out=$4
+    local base_url="$website/en/documentation/$product/$ver"
+    local refs ref pdfs u name filename
+
+    refs=$(
+        printf '%s' "$index_html" \
+            | grep -o 'href="[^"]*"' \
+            | sed 's/^href="//; s/"$//; s/[#?].*$//' \
+            | sed "s#^$website##" \
+            | grep -E "^/en/documentation/$product/$ver/download_pdf-[^/]+$" \
+            | sort -u
+    )
+    if [ -z "$refs" ]; then
+        echo "  ! [$ver] no document links found"; return 0
+    fi
+
+    pdfs=$(
+        while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            fetch "$website$ref" 2>/dev/null \
+                | grep -o 'href="[^"]*\.pdf"' \
+                | sed 's/^href="//; s/"$//'
+        done <<EOF
+$refs
+EOF
+    )
+    pdfs=$(printf '%s\n' "$pdfs" | while IFS= read -r u; do
+        [ -n "$u" ] || continue
+        case "$u" in
+            http*://*) printf '%s\n' "$u" ;;
+            //*)       printf 'https:%s\n' "$u" ;;
+            /*)        printf '%s%s\n' "$website" "$u" ;;
+            *)         printf '%s/%s\n' "$base_url" "$u" ;;
+        esac
+    done | sort -u)
+    if [ -z "$pdfs" ]; then
+        echo "  ! [$ver] PDF reference page has no PDF links"; return 0
+    fi
+
+    mkdir -p "$out" || { echo "  ! cannot create $out"; return 1; }
+
+    while IFS= read -r u; do
+        [ -n "$u" ] || continue
+        name="${u##*/}"; name="${name%.pdf}"
+        filename="$out/${product}-${ver}-${name}.pdf"
+        printf '  * [%s] %s: ' "$ver" "$name"
+
+        if [ -s "$filename" ]; then
+            echo "already downloaded"; _SKIP=$((_SKIP + 1)); continue
+        fi
+        if curl -fL --retry 3 --retry-delay 2 --max-time 1800 \
+                -sS -o "$filename" "$u" && [ -s "$filename" ]; then
+            echo "OK"; _OK=$((_OK + 1))
+        else
+            echo "FAILED"; rm -f "$filename"; _FAIL=$((_FAIL + 1))
+        fi
+        if [ "$SLEEP" -gt 0 ] 2>/dev/null; then sleep "$SLEEP"; fi
+    done <<EOF
+$pdfs
 EOF
 }
 
